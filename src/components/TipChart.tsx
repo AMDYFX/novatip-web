@@ -372,6 +372,38 @@ export function TipChart({ jwt }: TipChartProps) {
               gradId={`grad-${gradId}`}
             />
           </div>
+
+          {/*
+            Text alternative for the chart. ChartSvg is aria-hidden because an
+            SVG path is meaningless to a screen reader; this visually hidden
+            table carries the actual daily values instead, and follows both the
+            selected mode and window so it always describes what is on screen.
+          */}
+          <table className="sr-only">
+            <caption>
+              Daily {mode === "count" ? "tip count" : "USDC earned"} over the last {window} days
+            </caption>
+            <thead>
+              <tr>
+                <th scope="col">Date</th>
+                <th scope="col">{mode === "count" ? "Tips" : "USDC earned"}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {series.map((point) => (
+                <tr key={point.date}>
+                  <th scope="row">
+                    <time dateTime={point.date}>{fmtDate(point.date)}</time>
+                  </th>
+                  <td>
+                    {mode === "count"
+                      ? point.tipCount.toLocaleString()
+                      : `$${formatUsdc(BigInt(point.amountRaw), 2)}`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
     </Card>
