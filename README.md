@@ -523,8 +523,11 @@ the server render cannot know the result, `<html>` carries `suppressHydrationWar
 
 Two rules keep it flash-free:
 
-- **Never re-derive the theme after hydration.** `ThemeToggle` reads the class the
-  script already applied (`getAppliedTheme()`), it does not read storage and re-apply.
+- **Never re-apply the theme after hydration.** The class the script already applied
+  is the source of truth for what is painted (`getAppliedTheme()`). `ThemeToggle`
+  does read the stored *preference* after hydration so it can distinguish "system"
+  from an explicit light/dark choice, but it never re-applies the theme and its first
+  render uses the server-safe "system" default so hydration still matches.
 - **Style with the semantic tokens, not raw colours.** Use `bg-canvas`, `bg-surface`,
   `border-hairline`, `text-fg` / `-muted` / `-subtle` / `-faint` / `-dim`, `text-accent`,
   and `success` / `warning` / `danger`. They are CSS variables defined for both themes in
