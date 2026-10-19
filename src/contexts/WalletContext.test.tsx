@@ -1,196 +1,214 @@
 /**
  * src/contexts/WalletContext.test.tsx
  *
- * Unit tests for the two ways a wallet session is established or torn down in
- * WalletContext.
+ * Behavioural tests for the two ways a session enters or leaves the app
+ * without the user clicking anything new:
  *
- * Rehydration is deliberately independent for the key and the JWT: a wallet
- * connected without a creator session is the normal state for someone who
- * only came to tip, and requiring both would log them straight back out. The
- * one exception is a JWT that is already expired client-side, which is
- * dropped without a round trip.
+ *   - rehydration on mount, where the wallet key and the creator JWT are
+ *     restored independently from storage
+ *   - teardown on a 401 broadcast, which must clear the key, the JWT and
+ *     storage together and explain why
  *
- * Teardown happens on two paths that must reach the same end state: any 401
- * broadcast through authEvents, and an explicit disconnect. A 401 also leaves
- * a message behind explaining why the user was logged out; disconnect is a
- * deliberate action and clears it.
+ * Both paths are load-bearing: a bug in rehydration silently logs a returning
+ * visitor out, and a bug in teardown leaves the dashboard rendering against a
+ * dead token. They are pinned here through `useWallet`, the same interface
+ * every screen consumes, rather than by reaching into the provider's state.
  *
- * Covers:
- *   - A stored public key restores the connection without a JWT
- *   - An expired JWT is removed from storage and not restored
- *   - A valid JWT is restored alongside the key
- *   - emitUnauthorized clears storage and session state and sets the message
- *   - disconnect clears the same session state, including the message
+ * The storage keys are asserted by name on purpose. They are the contract
+ * between this provider and a previous visit to the site — an existing
+ * session lives under these exact keys — so renaming one is a breaking change
+ * that should fail a test, not slip through because the test imported the
+ * same private constant.
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { render, screen, cleanup, waitFor, act } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { render, screen, cleanup, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { WalletProvider, useWallet } from "./WalletContext";
 import { emitUnauthorized } from "@/lib/authEvents";
 
+// The provider imports the Freighter helpers even though neither rehydration
+// nor teardown calls them. Replacing the module keeps this file focused on
+// state transitions instead of a wallet extension that is not installed in
+// the test environment.
 vi.mock("@/lib/wallet", () => ({
-  connectFreighter: vi.fn(),
-  isFreighterInstalled: vi.fn().mockResolvedValue(true),
-  signNonce: vi.fn(),
-}));
-
-vi.mock("@/lib/api", () => ({
-  authApi: {
-    challenge: vi.fn(),
-    verify: vi.fn(),
-  },
+  connectFreighter:     vi.fn(),
+  isFreighterInstalled: vi.fn(),
+  signNonce:            vi.fn(),
 }));
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
-const PK = "GD7UXR3IX276M2M4XUE3TPNKTA7PJTERTEDEGWELQQYQBBHDL2NTREFR";
-const JWT_STORAGE_KEY = "novatip_jwt";
-const PK_STORAGE_KEY = "novatip_pk";
-const EXPIRED_MESSAGE =
-  "Your session has expired. Please reconnect your wallet.";
+const PK_KEY  = "novatip_pk";
+const JWT_KEY = "novatip_jwt";
 
-/** Build a structurally valid JWT-shaped token with the given `exp` claim. */
-function makeJwt(expSecondsFromNow: number): string {
-  const payload = btoa(
-    JSON.stringify({ exp: Math.floor(Date.now() / 1000) + expSecondsFromNow }),
-  )
+const PUBLIC_KEY = "GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGHIJKLMNOPQR";
+
+const EXPIRY_MESSAGE = "Your session has expired. Please reconnect your wallet.";
+
+/** Encode a JWT payload the way `lib/jwt.ts` decodes it: base64url, unpadded. */
+function base64Url(obj: unknown): string {
+  return btoa(JSON.stringify(obj))
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/, "");
-  return `header.${payload}.signature`;
 }
 
+function makeJwt(expOffsetSeconds: number): string {
+  const header  = base64Url({ alg: "none", typ: "JWT" });
+  const payload = base64Url({
+    exp: Math.floor(Date.now() / 1000) + expOffsetSeconds,
+  });
+  return `${header}.${payload}.signature`;
+}
+
+const VALID_JWT   = makeJwt(3600);
+const EXPIRED_JWT = makeJwt(-3600);
+
 /**
- * Exposes the context values as text so assertions read the state the rest of
- * the app would consume, rather than poking at internal hooks.
+ * Renders the public surface of the context. Reading through the hook means
+ * these tests fail if the provider stops exposing a field, which is exactly
+ * as important as the field's value.
  */
-function Harness() {
+function WalletProbe() {
   const { publicKey, jwt, isConnected, error, disconnect } = useWallet();
 
   return (
-    <div>
-      <output data-testid="public-key">{publicKey ?? "null"}</output>
-      <output data-testid="jwt">{jwt ?? "null"}</output>
-      <output data-testid="connected">{String(isConnected)}</output>
-      <output data-testid="error">{error ?? "null"}</output>
+    <>
+      <output data-testid="public-key">{publicKey ?? "none"}</output>
+      <output data-testid="jwt">{jwt ?? "none"}</output>
+      <output data-testid="is-connected">{String(isConnected)}</output>
+      <output data-testid="error">{error ?? "none"}</output>
       <button type="button" onClick={disconnect}>
-        disconnect
+        Disconnect wallet
       </button>
-    </div>
+    </>
   );
 }
 
 function renderWallet() {
   return render(
     <WalletProvider>
-      <Harness />
+      <WalletProbe />
     </WalletProvider>,
   );
 }
 
-/** Wait for the mount effect to finish restoring the key, then check state. */
-async function expectRestored(storedJwt: string | null) {
-  await waitFor(() =>
-    expect(screen.getByTestId("public-key")).toHaveTextContent(PK),
-  );
-  await waitFor(() =>
-    expect(screen.getByTestId("jwt")).toHaveTextContent(storedJwt ?? "null"),
-  );
-  expect(screen.getByTestId("connected")).toHaveTextContent("true");
-}
-
 beforeEach(() => {
   localStorage.clear();
-  vi.clearAllMocks();
 });
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   localStorage.clear();
 });
 
-// ── Rehydration ───────────────────────────────────────────────────────────────
+// ── Rehydration (#239) ────────────────────────────────────────────────────────
 
-describe("WalletContext – rehydration", () => {
-  it("restores a stored public key without requiring a JWT", async () => {
-    localStorage.setItem(PK_STORAGE_KEY, PK);
+describe("WalletProvider – rehydration", () => {
+  it("restores a stored public key without requiring a creator session", () => {
+    // The normal state for someone who only came to tip: the wallet is
+    // connected, but there is no dashboard session and never was. Requiring
+    // a JWT here would log them straight back out.
+    localStorage.setItem(PK_KEY, PUBLIC_KEY);
 
     renderWallet();
 
-    await expectRestored(null);
-    expect(localStorage.getItem(JWT_STORAGE_KEY)).toBeNull();
-    expect(screen.getByTestId("error")).toHaveTextContent("null");
+    expect(screen.getByTestId("public-key")).toHaveTextContent(PUBLIC_KEY);
+    expect(screen.getByTestId("is-connected")).toHaveTextContent("true");
+    expect(screen.getByTestId("jwt")).toHaveTextContent("none");
+    expect(screen.getByTestId("error")).toHaveTextContent("none");
+    expect(localStorage.getItem(JWT_KEY)).toBeNull();
   });
 
-  it("removes an already-expired JWT instead of restoring it", async () => {
-    const expired = makeJwt(-60);
-    localStorage.setItem(PK_STORAGE_KEY, PK);
-    localStorage.setItem(JWT_STORAGE_KEY, expired);
+  it("restores a stored JWT that has not expired", () => {
+    localStorage.setItem(PK_KEY, PUBLIC_KEY);
+    localStorage.setItem(JWT_KEY, VALID_JWT);
 
     renderWallet();
 
-    // The key still marks the wallet connected; only the dead session is
-    // dropped, so a tipper is not disconnected for having no creator session.
-    await expectRestored(null);
-    expect(localStorage.getItem(JWT_STORAGE_KEY)).toBeNull();
+    expect(screen.getByTestId("jwt")).toHaveTextContent(VALID_JWT);
+    expect(screen.getByTestId("is-connected")).toHaveTextContent("true");
+    // The token is still valid, so it must survive rehydration in storage too.
+    expect(localStorage.getItem(JWT_KEY)).toBe(VALID_JWT);
   });
 
-  it("restores a valid JWT alongside the key", async () => {
-    const valid = makeJwt(60 * 60);
-    localStorage.setItem(PK_STORAGE_KEY, PK);
-    localStorage.setItem(JWT_STORAGE_KEY, valid);
+  it("removes an expired JWT instead of restoring it", () => {
+    localStorage.setItem(PK_KEY, PUBLIC_KEY);
+    localStorage.setItem(JWT_KEY, EXPIRED_JWT);
 
     renderWallet();
 
-    await expectRestored(valid);
-    expect(localStorage.getItem(JWT_STORAGE_KEY)).toBe(valid);
-    expect(screen.getByTestId("error")).toHaveTextContent("null");
+    expect(screen.getByTestId("jwt")).toHaveTextContent("none");
+    // Expiry only discards the dead token — it must not take the wallet
+    // connection down with it.
+    expect(screen.getByTestId("public-key")).toHaveTextContent(PUBLIC_KEY);
+    expect(screen.getByTestId("is-connected")).toHaveTextContent("true");
+    // Skipping the round trip is only useful if the dead token is also gone;
+    // leaving it behind would make every later visit repeat the same check.
+    expect(localStorage.getItem(JWT_KEY)).toBeNull();
   });
 });
 
-// ── Teardown ──────────────────────────────────────────────────────────────────
+// ── Session teardown on 401 (#240) ────────────────────────────────────────────
 
-describe("WalletContext – session teardown", () => {
-  it("clears the session and explains why when a 401 is broadcast", async () => {
-    const valid = makeJwt(60 * 60);
-    localStorage.setItem(PK_STORAGE_KEY, PK);
-    localStorage.setItem(JWT_STORAGE_KEY, valid);
+describe("WalletProvider – session teardown on 401", () => {
+  it("clears the key, the JWT and storage when a 401 is broadcast", () => {
+    localStorage.setItem(PK_KEY, PUBLIC_KEY);
+    localStorage.setItem(JWT_KEY, VALID_JWT);
 
     renderWallet();
-    await expectRestored(valid);
 
-    act(() => emitUnauthorized());
+    // Confirm the session was actually live before tearing it down, so this
+    // test cannot pass against a provider that never restored anything.
+    expect(screen.getByTestId("is-connected")).toHaveTextContent("true");
+    expect(screen.getByTestId("jwt")).toHaveTextContent(VALID_JWT);
 
-    expect(screen.getByTestId("public-key")).toHaveTextContent("null");
-    expect(screen.getByTestId("jwt")).toHaveTextContent("null");
-    expect(screen.getByTestId("connected")).toHaveTextContent("false");
-    expect(screen.getByTestId("error")).toHaveTextContent(EXPIRED_MESSAGE);
+    act(() => {
+      emitUnauthorized();
+    });
 
-    expect(localStorage.getItem(PK_STORAGE_KEY)).toBeNull();
-    expect(localStorage.getItem(JWT_STORAGE_KEY)).toBeNull();
+    expect(screen.getByTestId("public-key")).toHaveTextContent("none");
+    expect(screen.getByTestId("jwt")).toHaveTextContent("none");
+    expect(screen.getByTestId("is-connected")).toHaveTextContent("false");
+    expect(localStorage.getItem(PK_KEY)).toBeNull();
+    expect(localStorage.getItem(JWT_KEY)).toBeNull();
   });
 
-  it("clears the same session state on disconnect, without an expiry message", async () => {
-    const valid = makeJwt(60 * 60);
-    localStorage.setItem(PK_STORAGE_KEY, PK);
-    localStorage.setItem(JWT_STORAGE_KEY, valid);
+  it("sets the session-expired message when a 401 is broadcast", () => {
+    localStorage.setItem(PK_KEY, PUBLIC_KEY);
+    localStorage.setItem(JWT_KEY, VALID_JWT);
 
     renderWallet();
-    await expectRestored(valid);
+
+    act(() => {
+      emitUnauthorized();
+    });
+
+    expect(screen.getByTestId("error")).toHaveTextContent(EXPIRY_MESSAGE);
+  });
+
+  it("clears the same state when the user disconnects deliberately", async () => {
+    localStorage.setItem(PK_KEY, PUBLIC_KEY);
+    localStorage.setItem(JWT_KEY, VALID_JWT);
 
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "disconnect" }));
+    renderWallet();
 
-    expect(screen.getByTestId("public-key")).toHaveTextContent("null");
-    expect(screen.getByTestId("jwt")).toHaveTextContent("null");
-    expect(screen.getByTestId("connected")).toHaveTextContent("false");
+    expect(screen.getByTestId("is-connected")).toHaveTextContent("true");
 
-    // Leaving on purpose is not a failure, so there is no session-expired
-    // message to show the user afterwards.
-    expect(screen.getByTestId("error")).toHaveTextContent("null");
+    await user.click(screen.getByRole("button", { name: "Disconnect wallet" }));
 
-    expect(localStorage.getItem(PK_STORAGE_KEY)).toBeNull();
-    expect(localStorage.getItem(JWT_STORAGE_KEY)).toBeNull();
+    expect(screen.getByTestId("public-key")).toHaveTextContent("none");
+    expect(screen.getByTestId("jwt")).toHaveTextContent("none");
+    expect(screen.getByTestId("is-connected")).toHaveTextContent("false");
+    expect(localStorage.getItem(PK_KEY)).toBeNull();
+    expect(localStorage.getItem(JWT_KEY)).toBeNull();
+
+    // A deliberate disconnect is not an expiry. Leaving the 401 message
+    // behind would tell someone who just disconnected that their session
+    // expired, which is both wrong and confusing.
+    expect(screen.getByTestId("error")).toHaveTextContent("none");
   });
 });
