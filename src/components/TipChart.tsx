@@ -410,7 +410,50 @@ export function TipChart({ jwt }: TipChartProps) {
   );
 }
 
+interface ChartPoint {
+  x: number;
+  y: number;
+  label?: string;
+}
 
+interface ChartSvgProps {
+  points: ChartPoint[];
+  pathD: string;
+}
+
+export const ChartSvg: React.FC<ChartSvgProps> = ({ points, pathD }) => {
+  return (
+    <div className="chart-svg-container">
+      <svg
+        viewBox="0 0 600 120"
+        preserveAspectRatio="none"
+        className="tip-chart-svg"
+      >
+        {/* Line path with non-scaling stroke so width stays constant when stretched */}
+        <path
+          d={pathD}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          vectorEffect="non-scaling-stroke"
+          className="chart-line"
+        />
+
+        {/* Data dots with non-scaling stroke and constant rendering */}
+        {points.map((pt, idx) => (
+          <circle
+            key={idx}
+            cx={pt.x}
+            cy={pt.y}
+            r="3"
+            className="chart-dot"
+            vectorEffect="non-scaling-stroke"
+          />
+        ))}
+      </svg>
+    </div>
+  );
+};
 export interface TipDataPoint {
   date: string;
   amountRaw: string; // Raw stroop amount string
